@@ -191,11 +191,27 @@ class Root:
         attendee, group = self._get_unsaved(id)
         return {'attendee': attendee}
 
+    def process_free_prereg(self, session):
+        charge = Charge(listify(self.unpaid_preregs.values()))
+        if charge.total_cost <= 0:
+            for attendee in charge.attendees:
+                session.add(attendee)
+
+            for group in charge.groups:
+                session.add(group)
+
+            self.unpaid_preregs.clear()
+            self.paid_preregs.extend(charge.targets)
+            raise HTTPRedirect('paid_preregistrations?payment_received={}', charge.dollar_amount)
+        else:
+            message = "These badges aren't free! Please pay for them."
+            raise HTTPRedirect('index?message={}', message)
+
     @credit_card
     def prereg_payment(self, session, payment_id, stripeToken):
         charge = Charge.get(payment_id)
         if not charge.total_cost:
-            message = 'Your preregistration has already been paid for, so your credit card has not been charged'
+            message = 'Your total cost was $0. Your credit card has not been charged.'
         elif charge.amount != charge.total_cost:
             message = 'Our preregistration price has gone up; please fill out the payment form again at the higher price'
         else:
@@ -241,9 +257,10 @@ class Root:
     def dealer_confirmation(self, session, id):
         return {'group': session.group(id)}
 
+    @log_pageview
     def group_members(self, session, id, message=''):
         group = session.group(id)
-        charge = Charge([group, group.leader]) if group.leader else Charge(group)
+        charge = Charge(group)
         return {
             'group':   group,
             'charge':  charge,
@@ -273,6 +290,7 @@ class Root:
                 attendee.badge_num = badge_being_claimed.badge_num
                 attendee.ribbon = badge_being_claimed.ribbon
                 attendee.paid = badge_being_claimed.paid
+                attendee.overridden_price = badge_being_claimed.overridden_price
 
                 session.delete_from_group(badge_being_claimed, group)
                 group.attendees.append(attendee)
@@ -310,12 +328,6 @@ class Root:
         else:
             group.amount_paid += charge.dollar_amount
 
-            for attendee in charge.attendees:
-                # Subtract an attendee's extras, if they're not already paid for.
-                group.amount_paid -= attendee.amount_unpaid
-                attendee.amount_paid += attendee.amount_unpaid
-                session.merge(attendee)
-
             session.merge(group)
             if group.tables:
                 try:
@@ -347,8 +359,7 @@ class Root:
         except:
             log.error('unable to send group unset email', exc_info=True)
 
-        session.assign_badges(attendee.group, attendee.group.badges + 1, registered=attendee.registered, paid=attendee.paid)
-        attendee.group.cost -= attendee.group.new_badge_cost  # We add this value to the group in assign_badges; undo!
+        session.assign_badges(attendee.group, attendee.group.badges + 1, new_badge_type=attendee.badge_type, new_ribbon_type=attendee.ribbon, registered=attendee.registered, paid=attendee.paid)
         session.delete_from_group(attendee, attendee.group)
         raise HTTPRedirect('group_members?id={}&message={}', attendee.group_id, 'Attendee unset; you may now assign their badge to someone else')
 
@@ -383,15 +394,17 @@ class Root:
             raise HTTPRedirect('group_members?id={}&message={}', group.id, 'You payment has been accepted and the badges have been added to your group')
 
     @attendee_id_required
+    @log_pageview
     def transfer_badge(self, session, message='', **params):
         old = session.attendee(params['id'])
+
         assert old.is_transferable, 'This badge is not transferrable'
         session.expunge(old)
         attendee = session.attendee(params, restricted=True)
 
         if 'first_name' in params:
             message = check(attendee, prereg=True)
-            if old.first_name == attendee.first_name and old.last_name == attendee.last_name:
+            if (old.first_name == attendee.first_name and old.last_name == attendee.last_name) or (old.legal_name and old.legal_name == attendee.legal_name):
                 message = 'You cannot transfer your badge to yourself.'
             elif not message and (not params['first_name'] and not params['last_name']):
                 message = check(attendee, prereg=True)
@@ -425,12 +438,16 @@ class Root:
     def invalid_badge(self, session, id, message=''):
         return {'attendee': session.attendee(id, allow_invalid=True), 'message': message}
 
+    def confirmation_not_found(self, id, message):
+        return {'id': id, 'message': message}
+
     def invalidate(self, session, id):
         attendee = session.attendee(id)
         attendee.badge_status = c.INVALID_STATUS
         raise HTTPRedirect('invalid_badge?id={}&message={}', attendee.id, 'Sorry you can\'t make it! We hope to see you next year!')
 
     @attendee_id_required
+    @log_pageview
     def confirm(self, session, message='', return_to='confirm', undoing_extra='', **params):
         attendee = session.attendee(params, restricted=True)
 
@@ -475,6 +492,7 @@ class Root:
         cherrypy.session['staffer_id'] = attendee.id
         raise HTTPRedirect('../signups/food_restrictions')
 
+    @attendee_id_required
     def attendee_donation_form(self, session, id, message=''):
         attendee = session.attendee(id)
         if attendee.amount_unpaid <= 0:
